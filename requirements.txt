@@ -1,0 +1,7 @@
+# pinned to what obsload.py was verified against
+# (gevent 26.8.0 comes in via locust; no need to pin it separately)
+locust==2.46.3
+boto3==1.43.76
+
+# NOTE: do not add awscli v1 here - it pins botocore exactly and will fight
+# boto3's pin. Use awscli v2, or install v1 into a separate venv.
