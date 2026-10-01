@@ -102,8 +102,8 @@ throughput_log = logging.getLogger("obsload.throughput")  # its own logger, for 
 # followers or connects to the leader, so this happens once per host. Loaded
 # later, it can stall a process long enough to miss Locust's heartbeats.
 boto3.client("s3", region_name="us-east-1")
-# gevent loads its DNS resolver and thread pool on first use. Load them now,
-# so that happens outside the first measured request.
+# gevent imports its DNS resolver and thread pool on first use. Import them
+# now, so that happens outside the first measured request.
 gevent.config.resolver
 gevent.config.threadpool
 # The S3 clients skip TLS certificate checks. Hide the warning urllib3
@@ -122,8 +122,8 @@ def _add_options(parser):
 
     # where requests go
     g.add_argument("--s3-endpoint", default=os.environ.get("S3_ENDPOINT"),
-                   help="endpoint URL, or comma-separated URLs round-robined "
-                        "per request")
+                   help="endpoint URL, or comma-separated URLs; each request "
+                        "picks one at random")
     g.add_argument("--preload-endpoint", default="",
                    help="endpoint(s) for preload GETs and --warm PUTs; "
                         "default --s3-endpoint")
@@ -195,7 +195,7 @@ SETUP = SimpleNamespace(
     process_delay=None,     # seconds of simulated compute: (min, max)
     consume_delay=None,     # seconds from upload to a Consumer's read: (min, max)
     consume_tags=None,      # writeout tags Consumers read; empty means all
-    clients=None,           # {stage: endless cycle of S3 clients}
+    clients=None,           # {stage: list of S3 clients, one per endpoint}
     payload=None,           # 64MiB of random bytes that every upload reads from
 )
 
@@ -402,11 +402,14 @@ class Worker(User):
             record_failure("sched/stale", late,
                            f"{job} claimed {late:.1f}s after its exposure; dropped")
             return
-        if job.exposure_done.is_set():
-            # Processing needs the calibration, so a late job still downloads it.
-            record_failure("sched/preload-late", late,
-                           f"{job} claimed after its exposure; preload ran late")
-        self._download_calibration(job)
+        # Skip the calibration when the exposure already ended without an upload.
+        ended_badly = job.exposure_done.is_set() and job.outcome != "uploaded"
+        if not ended_badly:
+            if late > 0:
+                # Processing needs the calibration, so a late job still downloads it.
+                record_failure("sched/preload-late", late,
+                               f"{job} claimed after its exposure; preload ran late")
+            self._download_calibration(job)
 
         wait_limit = 2 * sum(SETUP.cadence)
         if not job.exposure_done.wait(timeout=wait_limit):
@@ -545,7 +548,7 @@ def download_all(stage, keys, clients):
     """Download every (tag, key) in keys, --concurrency at a time. Each object
     is recorded as stage/tag, and the whole batch as stage/all."""
     t0 = time.perf_counter()
-    run_concurrently(OPTS.concurrency, [(download, next(clients), key, f"{stage}/{tag}")
+    run_concurrently(OPTS.concurrency, [(download, random.choice(clients), key, f"{stage}/{tag}")
                                         for tag, key in keys])
     record_since(f"{stage}/all", t0)
 
@@ -554,29 +557,31 @@ def upload_all(stage, objects, clients, rng):
     """Upload every (tag, key, size) in objects, --concurrency at a time,
     recorded like download_all. Returns the (tag, key) of each upload that
     worked."""
-    uploaded = []
-
-    def upload_one(client, tag, key, size):
-        if upload(client, key, size, rng, f"{stage}/{tag}"):
-            uploaded.append((tag, key))
-
     t0 = time.perf_counter()
-    run_concurrently(OPTS.concurrency, [(upload_one, next(clients), tag, key, size)
-                                        for tag, key, size in objects])
-    record_since(f"{stage}/all", t0, sum(size for _, _, size in objects))
+    worked = run_concurrently(OPTS.concurrency,
+                              [(upload, random.choice(clients), key, size, rng, f"{stage}/{tag}")
+                               for tag, key, size in objects])
+    uploaded, moved = [], 0
+    for (tag, key, size), ok in zip(objects, worked):
+        if ok:
+            uploaded.append((tag, key))
+            moved += size
+    record_since(f"{stage}/all", t0, moved)
     return uploaded
 
 
 def run_concurrently(width, calls):
     """Run every call, a (function, arg, ...) tuple, at most width at a time,
-    and wait for all of them."""
+    wait for all of them, and return what each one returned, in order."""
     pool = GPool(width)
+    greenlets = []
     try:
         for call in calls:
-            pool.spawn(*call)
+            greenlets.append(pool.spawn(*call))
         pool.join()
     finally:
         pool.kill(block=False)  # if we're killed mid-join, gevent would leave the calls running
+    return [g.value for g in greenlets]
 
 
 class PayloadReader(io.RawIOBase):
@@ -619,8 +624,9 @@ def make_client(endpoint):
     """An S3 client for endpoint, set up to keep the load generator's own CPU
     out of the measured times."""
     config = BotoConfig(
-        # Up to 4096 open connections per client, enough for a full-size
-        # exposure burst. Raise `ulimit -n` to match on big runs.
+        # Keep up to 4096 connections per client open for reuse. A burst can
+        # open more, and urllib3 closes the extras when they finish.
+        # Raise `ulimit -n` on big runs.
         max_pool_connections=4096,
         # One attempt per request, so every failure shows up in the stats.
         retries={"total_max_attempts": 1, "mode": "standard"},
@@ -680,9 +686,10 @@ def _on_init(environment, **_):
         for name in ("botocore", "boto3", "urllib3", "s3transfer"):
             logging.getLogger(name).setLevel(logging.WARNING)
 
-    # With --logfile, Locust sends log lines to the file only. The leader
-    # also shows obsload's warnings, errors and throughput lines on the console.
-    if OPTS.logfile and is_leader():
+    # With --logfile, Locust sends log lines to the file only. The leader, or a
+    # single process, also shows obsload's warnings, errors and throughput
+    # lines on the console.
+    if OPTS.logfile and not is_follower():
         fmt = logging.Formatter("[%(asctime)s] %(levelname)s obsload: %(message)s")
         problems = logging.StreamHandler()
         problems.setFormatter(fmt)
@@ -700,6 +707,15 @@ def _on_init(environment, **_):
         parse_spec(spec)
     for text in (OPTS.cadence, OPTS.process_delay, OPTS.consume_delay):
         parse_range(text)
+    endpoints = [OPTS.s3_endpoint or "", OPTS.preload_endpoint, OPTS.exposure_endpoint,
+                 OPTS.writeout_endpoint, OPTS.consume_endpoint]
+    for url in ",".join(endpoints).split(","):
+        if url.strip() and "://" not in url:
+            raise ValueError(f"endpoint {url.strip()!r} needs http:// or https://")
+
+    # A warm runs until every object is written, whatever --run-time says.
+    if OPTS.warm:
+        OPTS.run_time = None
 
     # Run exactly this many users of each class.
     Detector.fixed_count = OPTS.detectors
@@ -743,17 +759,18 @@ def _setup_process():
 
     # One set of clients per process, shared by its users and built before
     # they start: building one per user takes long enough to miss visit 0.
-    # Each stage round-robins over its endpoints (its own option, or
-    # --s3-endpoint), and stages with the same endpoints share one cycle.
-    cycles = {}
+    # Each stage gets one client per endpoint (its own option, or
+    # --s3-endpoint), and each request picks one at random. Stages with the
+    # same endpoints share clients.
+    built = {}
 
     def clients_for(endpoints):
         endpoints = endpoints or OPTS.s3_endpoint or ""
-        if endpoints not in cycles:
+        if endpoints not in built:
             urls = [u.strip() for u in endpoints.split(",") if u.strip()]
             # with no endpoint at all, boto3 talks to AWS itself
-            cycles[endpoints] = itertools.cycle([make_client(u) for u in urls or [None]])
-        return cycles[endpoints]
+            built[endpoints] = [make_client(u) for u in urls or [None]]
+        return built[endpoints]
 
     SETUP.clients = {"preload": clients_for(OPTS.preload_endpoint),
                      "exposure": clients_for(OPTS.exposure_endpoint),
@@ -807,27 +824,20 @@ def _on_schedule(environment, msg, **_):
     SCHEDULE_READY.set()
 
 
-@events.worker_connect.add_listener
-def _on_follower_connect(client_id, **_):
-    """Leader: send the schedule to a follower that connects after it went out
-    (a late or reconnecting one). Its users wait until it arrives."""
-    if SCHEDULE:
-        RUNNER.send_message("obsload_schedule", dict(SCHEDULE, sent_at=time.time()),
-                            client_id=client_id)
-
-
 def _warm():
     """Upload the calibration objects Workers download: --preload-spec for
     each of --detectors, 64 at a time, through the first preload client."""
-    client = next(SETUP.clients["preload"])
+    client = SETUP.clients["preload"][0]
     rng = random.Random()
     calls = []
     for det in range(OPTS.detectors):
         for obj in SETUP.preload_objects:
             calls.append((upload, client, calib_key(det, obj), obj.size(rng), rng,
                           f"warm/{obj.tag}"))
-    run_concurrently(64, calls)
-    log.info("warm complete: %d objects across %d detectors", len(calls), OPTS.detectors)
+    uploaded = run_concurrently(64, calls).count(True)
+    level = logging.INFO if uploaded == len(calls) else logging.ERROR
+    log.log(level, "warm complete: %d of %d objects uploaded, across %d detectors",
+            uploaded, len(calls), OPTS.detectors)
 
 
 # ============================================================================
@@ -893,7 +903,7 @@ class EvenDispatcher:
         # before it clears the mark.
         per_host, ranked = defaultdict(int), []
         for node in sorted(self.followers, key=lambda node: node.id):
-            host = node.id.split("_")[0]
+            host = node.id.rsplit("_", 1)[0]  # Locust's ids are <hostname>_<hex>
             ranked.append((per_host[host], node.id))
             per_host[host] += 1
         order = [node_id for _, node_id in sorted(ranked)]
@@ -981,8 +991,9 @@ def _add_counts(client_id, data, **_):
         total["write"] += moved["write"]
     for visit, started in counts["exposures"].items():
         if visit < LOG_STATE.next_visit:
-            log.warning("v%06d: %d more detector(s) fired, reported after the "
-                        "visit's line", visit, started["detectors"])
+            log.warning("v%06d: %d more detector(s) fired, max fire+%.3fs, reported "
+                        "after the visit's line", visit, started["detectors"],
+                        started["max_late"])
             continue
         count_exposure(visit, started["detectors"], started["max_late"])
 
@@ -1141,10 +1152,15 @@ def parse_spec(spec):
         if not part:
             continue
         tag, count, size = part.split(":", 2)
+        tag = tag.strip()
+        if any(obj.tag == tag for obj in objects):
+            raise ValueError(f"{spec!r}: tag {tag!r} appears twice, so its keys would collide")
         min_size, _, max_size = size.partition("-")
+        min_size, max_size = parse_size(min_size), parse_size(max_size or min_size)
+        if min_size > max_size:
+            raise ValueError(f"{part!r}: the minimum size is above the maximum")
         for index in range(int(count)):
-            objects.append(ObjectSpec(tag, index, parse_size(min_size),
-                                      parse_size(max_size or min_size)))
+            objects.append(ObjectSpec(tag, index, min_size, max_size))
     return objects
 
 

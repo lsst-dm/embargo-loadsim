@@ -25,7 +25,7 @@ Then start the leader, which coordinates the workload but does not run any:
 
     locust -f obsload.py --headless --run-time 15m \
            --detectors 189 --worker-pool 1200 \
-           --expect-workers 64 \
+           --master --expect-workers 64 \
            --s3-endpoint http://s3.example:9000 --bucket obsload --csv=run1
 
 Start followers across several hosts (in this case four):
@@ -54,6 +54,8 @@ Caveats:
 - Big runs open thousands of connections: raise `ulimit -n`.
 - Output files are partitioned by `--run-id` and do not clean themselves up.
 - Payloads are random data, designed to be difficult to compress.
+- Aggregated stats output at the end of the run is mixed with end to end
+  timing, so ignore the OBS rows.
 
 ## Reading the output
 
@@ -62,7 +64,7 @@ console shows the stats table, plus obsload's warnings, errors and throughput
 lines. The leader logs:
 
 - `throughput [etc]`:
-  for every `--througput-interval`, about 5 seconds after it ends. The byte counts add up
+  for every `--throughput-interval`, about 6 seconds after it ends. The byte counts add up
   exactly across lines. Bytes that reach the leader after their window's
   line (from a stalled follower) get a `late report` warning line.
   `throughput summary` is output once at the end with averages and max.
